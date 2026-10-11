@@ -5,7 +5,7 @@ Tools:
 - get_layout_info: Read GDS/OAS and return basic cell / layer / bbox info
 - run_drc: Run a KLayout .drc script in batch mode and return output summary
 - translate_laker_tf: Convert Laker Technology File (.tf) to KLayout layer properties (.lyp)
-  and connectivity rules for consistent net tracing
+  and connectivity rules (from tfLayoutConnection) for consistent net tracing
 
 Requirements:
   pip install fastmcp klayout
@@ -61,66 +61,117 @@ def _pretty_xml(elem: Element) -> str:
     return reparsed.toprettyxml(indent="  ")
 
 
+def _extract_block(content: str, block_name: str) -> str:
+    """Extract the content inside a named block like tfLayoutConnection { ... }."""
+    pattern = re.compile(
+        rf"{re.escape(block_name)}\s*\{{([^}}]*)\}}",
+        re.IGNORECASE | re.DOTALL
+    )
+    match = pattern.search(content)
+    return match.group(1) if match else ""
+
+
 def parse_laker_tf(tf_content: str) -> tuple[list[dict], list[dict]]:
     """
     Parse Laker Technology File for layers and connectivity.
 
+    Prioritizes:
+    - tfStreamIoTable / tfLayoutLayerTable for layer → GDS mapping
+    - tfLayoutConnection for explicit connectivity rules
+
     Returns:
         layers: list of layer mappings
-        connections: list of connection rules (for net tracing)
+        connections: list of connection rules (for KLayout net tracing)
     """
     layers = []
-    connections = []
+    layer_lookup = {}  # (name, purpose) → gds info, also name-only fallback
 
-    # Layer mapping pattern
-    layer_pattern = re.compile(
-        r"def\s*\{\s*(\w+)\s+(\w+)\s+(\d+)(?:\s+(\d+))?",
+    # Prefer stream table for accurate GDS mapping
+    stream_block = _extract_block(tf_content, "tfStreamIoTable")
+    layer_block = _extract_block(tf_content, "tfLayoutLayerTable")
+
+    # Parse stream table first (more accurate for GDS numbers)
+    stream_pattern = re.compile(
+        r"def\s*\{\s*(\w+)\s+(\w+)\s+(\d+)\s+(\d+)",
         re.IGNORECASE
     )
-
-    for match in layer_pattern.finditer(tf_content):
+    for match in stream_pattern.finditer(stream_block or tf_content):
         layer_name = match.group(1)
         purpose = match.group(2)
         gds_layer = int(match.group(3))
-        gds_datatype = int(match.group(4)) if match.group(4) else 0
+        gds_datatype = int(match.group(4))
 
-        key = (layer_name, purpose)
-        existing = next((l for l in layers if (l["layer_name"], l["purpose"]) == key), None)
-        if existing:
-            existing["gds_layer"] = gds_layer
-            existing["gds_datatype"] = gds_datatype
-        else:
-            layers.append({
+        entry = {
+            "layer_name": layer_name,
+            "purpose": purpose,
+            "gds_layer": gds_layer,
+            "gds_datatype": gds_datatype,
+            "display_name": f"{layer_name}.{purpose}"
+        }
+        layers.append(entry)
+        layer_lookup[(layer_name.lower(), purpose.lower())] = entry
+        layer_lookup[layer_name.lower()] = entry  # name-only fallback
+
+    # Fallback: parse layout layer table if stream table was empty
+    if not layers and layer_block:
+        layout_pattern = re.compile(
+            r"def\s*\{\s*(\w+)\s+(\w+)\s+(\d+)",
+            re.IGNORECASE
+        )
+        for match in layout_pattern.finditer(layer_block):
+            layer_name = match.group(1)
+            purpose = match.group(2)
+            gds_layer = int(match.group(3))
+            gds_datatype = 0
+
+            entry = {
                 "layer_name": layer_name,
                 "purpose": purpose,
                 "gds_layer": gds_layer,
                 "gds_datatype": gds_datatype,
                 "display_name": f"{layer_name}.{purpose}"
-            })
+            }
+            layers.append(entry)
+            layer_lookup[(layer_name.lower(), purpose.lower())] = entry
+            layer_lookup[layer_name.lower()] = entry
 
-    # Simple connectivity heuristics (common metal/via stacking)
-    # Look for sequential metal layers or via-related names
-    metal_layers = [l for l in layers if re.search(r"metal|met|m\d+", l["layer_name"], re.I)]
-    via_layers = [l for l in layers if re.search(r"via|cont|contact", l["layer_name"], re.I)]
+    # Parse tfLayoutConnection for explicit connectivity
+    connections = []
+    conn_block = _extract_block(tf_content, "tfLayoutConnection")
+    if conn_block:
+        conn_pattern = re.compile(
+            r"def\s*\{\s*(\w+)\s+(\w+)\s+(\w+)(?:\s+(\w+))?",
+            re.IGNORECASE
+        )
+        for match in conn_pattern.finditer(conn_block):
+            layer1 = match.group(1)
+            layer2 = match.group(2)
+            via = match.group(3)
+            extra = match.group(4)  # optional 4th token (e.g. MIM)
 
-    # Example: connect consecutive metals through vias if names suggest it
-    for i, metal in enumerate(metal_layers):
-        if i + 1 < len(metal_layers):
-            next_metal = metal_layers[i + 1]
-            # Try to find a matching via
-            via = next((v for v in via_layers if str(i + 1) in v["layer_name"] or "via" in v["layer_name"].lower()), None)
-            if via:
+            def resolve(name: str):
+                key = name.lower()
+                if key in layer_lookup:
+                    return layer_lookup[key]
+                # Try drawing purpose
+                if (key, "drawing") in layer_lookup:
+                    return layer_lookup[(key, "drawing")]
+                return None
+
+            l1 = resolve(layer1)
+            l2 = resolve(layer2)
+            v = resolve(via)
+
+            if l1 and l2 and v:
                 connections.append({
-                    "from": f"{metal['gds_layer']}/{metal['gds_datatype']}",
-                    "via": f"{via['gds_layer']}/{via['gds_datatype']}",
-                    "to": f"{next_metal['gds_layer']}/{next_metal['gds_datatype']}",
-                    "description": f"{metal['layer_name']} --{via['layer_name']}--> {next_metal['layer_name']}"
-                })
-            else:
-                connections.append({
-                    "from": f"{metal['gds_layer']}/{metal['gds_datatype']}",
-                    "to": f"{next_metal['gds_layer']}/{next_metal['gds_datatype']}",
-                    "description": f"{metal['layer_name']} --> {next_metal['layer_name']} (direct)"
+                    "from_layer": layer1,
+                    "from": f"{l1['gds_layer']}/{l1['gds_datatype']}",
+                    "via_layer": via,
+                    "via": f"{v['gds_layer']}/{v['gds_datatype']}",
+                    "to_layer": layer2,
+                    "to": f"{l2['gds_layer']}/{l2['gds_datatype']}",
+                    "extra": extra,
+                    "description": f"{layer1} --{via}--> {layer2}" + (f" ({extra})" if extra else "")
                 })
 
     return layers, connections
@@ -151,13 +202,15 @@ def generate_lyp(layers: list[dict]) -> str:
 
 def generate_connectivity_txt(connections: list[dict]) -> str:
     """Generate a simple text description of connectivity for KLayout layer stack."""
-    lines = ["# KLayout Connectivity Rules (generated from Laker TF)",
-             "# Use these in Tools > Edit Layer Stack or NetTracerConnectivity"]
+    lines = [
+        "# KLayout Connectivity Rules (generated from Laker tfLayoutConnection)",
+        "# Use these in Tools > Edit Layer Stack or with NetTracerConnectivity",
+        "# Format: conductor1 --via--> conductor2"
+    ]
     for conn in connections:
-        if "via" in conn:
-            lines.append(f"connection: {conn['from']} --via({conn['via']})--> {conn['to']}  # {conn['description']}")
-        else:
-            lines.append(f"connection: {conn['from']} --> {conn['to']}  # {conn['description']}")
+        lines.append(
+            f"connection: {conn['from']} --via({conn['via']})--> {conn['to']}  # {conn['description']}"
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -296,8 +349,8 @@ def translate_laker_tf(tf_file: str, output_lyp: str = None, output_connectivity
     and connectivity rules for consistent net tracing.
 
     Extracts:
-    - Layer names, purposes, GDS layer/datatype
-    - Basic metal/via connectivity stacking (for Trace Net)
+    - Layer names, purposes, GDS layer/datatype (from tfStreamIoTable / tfLayoutLayerTable)
+    - Explicit connections from tfLayoutConnection (for Trace Net)
 
     Args:
         tf_file: Path to the Laker .tf file
@@ -345,7 +398,7 @@ def translate_laker_tf(tf_file: str, output_lyp: str = None, output_connectivity
             result["output_connectivity"] = str(conn_path)
 
         if output_lyp or output_connectivity:
-            result["message"] = "Generated layer properties and/or connectivity rules."
+            result["message"] = "Generated layer properties and/or connectivity rules from tfLayoutConnection."
 
         return result
 
