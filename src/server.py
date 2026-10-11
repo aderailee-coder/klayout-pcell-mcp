@@ -6,6 +6,7 @@ Tools:
 - run_drc: Run a KLayout .drc script in batch mode
 - translate_laker_tf: Convert Laker TF to layer mapping + connectivity (lightweight)
 - generate_klayout_technology: Full conversion to .lyp + .lyt (with connectivity) + connectivity.txt
+- klayout_tech: Alias of generate_klayout_technology (preferred name)
 
 Requirements:
   pip install fastmcp klayout
@@ -223,6 +224,48 @@ def generate_lyt(tech_name: str, lyp_filename: str, connections: list[dict]) -> 
 '''
 
 
+def _generate_tech_files(tf_file: str, output_dir: str, tech_name: str) -> dict:
+    """Shared implementation for technology file generation."""
+    path = _safe_path(tf_file)
+    content = path.read_text(encoding="utf-8", errors="ignore")
+    layers, connections = parse_laker_tf(content)
+
+    if not layers:
+        return {
+            "status": "warning",
+            "message": "No layers found in TF.",
+            "num_layers": 0,
+            "num_connections": 0
+        }
+
+    out_dir = Path(output_dir).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    lyp_file = out_dir / f"{tech_name}.lyp"
+    lyt_file = out_dir / f"{tech_name}.lyt"
+    conn_file = out_dir / "connectivity.txt"
+
+    lyp_file.write_text(generate_lyp(layers), encoding="utf-8")
+    conn_file.write_text(generate_connectivity_txt(connections), encoding="utf-8")
+    lyt_file.write_text(generate_lyt(tech_name, lyp_file.name, connections), encoding="utf-8")
+
+    return {
+        "status": "ok",
+        "input_file": str(path),
+        "tech_name": tech_name,
+        "output_dir": str(out_dir),
+        "num_layers": len(layers),
+        "num_connections": len(connections),
+        "files": {
+            "lyp": str(lyp_file),
+            "lyt": str(lyt_file),
+            "connectivity": str(conn_file)
+        },
+        "install_hint": f"mkdir -p ~/.klayout/tech/{tech_name} && cp {out_dir}/* ~/.klayout/tech/{tech_name}/",
+        "open_hint": f"klayout your_design.gds -t {tech_name}"
+    }
+
+
 @mcp.tool
 def get_layout_info(file_path: str, top_cell: str = None) -> dict:
     """Read a GDS/OAS layout and return basic information."""
@@ -363,54 +406,40 @@ def generate_klayout_technology(
     - <tech_name>.lyp
     - <tech_name>.lyt (with connectivity embedded)
     - connectivity.txt
-
-    Args:
-        tf_file: Path to Laker .tf file
-        output_dir: Directory to write the technology files
-        tech_name: Name of the technology (used in filenames and .lyt)
-
-    Returns:
-        Paths of generated files and summary.
     """
     try:
-        path = _safe_path(tf_file)
-        content = path.read_text(encoding="utf-8", errors="ignore")
-        layers, connections = parse_laker_tf(content)
+        return _generate_tech_files(tf_file, output_dir, tech_name)
+    except Exception as e:
+        return {"error": str(e), "status": "error"}
 
-        if not layers:
-            return {
-                "status": "warning",
-                "message": "No layers found in TF.",
-                "num_layers": 0,
-                "num_connections": 0
-            }
 
-        out_dir = Path(output_dir).expanduser().resolve()
-        out_dir.mkdir(parents=True, exist_ok=True)
+@mcp.tool
+def klayout_tech(
+    tf_file: str,
+    output_dir: str,
+    tech_name: str = "LakerProcess"
+) -> dict:
+    """
+    Generate KLayout technology files (.lyp and .lyt) from a Laker TF.
 
-        lyp_file = out_dir / f"{tech_name}.lyp"
-        lyt_file = out_dir / f"{tech_name}.lyt"
-        conn_file = out_dir / "connectivity.txt"
+    This is the preferred tool for producing a complete KLayout Technology
+    that can be used with `klayout design.gds -t <tech_name>`.
 
-        lyp_file.write_text(generate_lyp(layers), encoding="utf-8")
-        conn_file.write_text(generate_connectivity_txt(connections), encoding="utf-8")
-        lyt_file.write_text(generate_lyt(tech_name, lyp_file.name, connections), encoding="utf-8")
+    Generates:
+    - <tech_name>.lyp
+    - <tech_name>.lyt (includes connectivity rules)
+    - connectivity.txt
 
-        return {
-            "status": "ok",
-            "input_file": str(path),
-            "tech_name": tech_name,
-            "output_dir": str(out_dir),
-            "num_layers": len(layers),
-            "num_connections": len(connections),
-            "files": {
-                "lyp": str(lyp_file),
-                "lyt": str(lyt_file),
-                "connectivity": str(conn_file)
-            },
-            "install_hint": f"mkdir -p ~/.klayout/tech/{tech_name} && cp {out_dir}/* ~/.klayout/tech/{tech_name}/",
-            "open_hint": f"klayout your_design.gds -t {tech_name}"
-        }
+    Args:
+        tf_file: Path to the Laker Technology File (.tf)
+        output_dir: Directory where the files will be written
+        tech_name: Technology name (used for filenames and inside .lyt)
+
+    Returns:
+        File paths, layer/connection counts, and install/open hints.
+    """
+    try:
+        return _generate_tech_files(tf_file, output_dir, tech_name)
     except Exception as e:
         return {"error": str(e), "status": "error"}
 
