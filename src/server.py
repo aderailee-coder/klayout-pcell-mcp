@@ -4,6 +4,7 @@ Minimal working FastMCP + KLayout example.
 Tools:
 - get_layout_info: Read GDS/OAS and return basic cell / layer / bbox info
 - run_drc: Run a KLayout .drc script in batch mode and return output summary
+- translate_laker_tf: Convert Laker Technology File (.tf) to KLayout layer properties (.lyp)
 
 Requirements:
   pip install fastmcp klayout
@@ -27,7 +28,10 @@ import os
 import subprocess
 import tempfile
 import json
+import re
 from pathlib import Path
+from xml.etree.ElementTree import Element, SubElement, tostring
+from xml.dom import minidom
 
 from fastmcp import FastMCP
 
@@ -47,6 +51,77 @@ def _safe_path(path: str) -> Path:
     if not p.exists():
         raise FileNotFoundError(f"File not found: {p}")
     return p
+
+
+def _pretty_xml(elem: Element) -> str:
+    """Return pretty-printed XML string."""
+    rough = tostring(elem, encoding="utf-8")
+    reparsed = minidom.parseString(rough)
+    return reparsed.toprettyxml(indent="  ")
+
+
+def parse_laker_tf(tf_content: str) -> list[dict]:
+    """
+    Parse Laker Technology File for layer name + purpose + GDS layer/datatype.
+
+    Supports common sections:
+    - tfLayoutLayerTable
+    - tfStreamIoTable
+    """
+    layers = []
+
+    # Match lines like: def { LayerName purpose gds_number ... } or def { LayerName purpose gds_number datatype }
+    # Flexible pattern for both tables
+    pattern = re.compile(
+        r"def\s*\{\s*(\w+)\s+(\w+)\s+(\d+)(?:\s+(\d+))?",
+        re.IGNORECASE
+    )
+
+    for match in pattern.finditer(tf_content):
+        layer_name = match.group(1)
+        purpose = match.group(2)
+        gds_layer = int(match.group(3))
+        gds_datatype = int(match.group(4)) if match.group(4) else 0
+
+        # Avoid duplicates (prefer stream table entries if present)
+        key = (layer_name, purpose)
+        existing = next((l for l in layers if (l["layer_name"], l["purpose"]) == key), None)
+        if existing:
+            existing["gds_layer"] = gds_layer
+            existing["gds_datatype"] = gds_datatype
+        else:
+            layers.append({
+                "layer_name": layer_name,
+                "purpose": purpose,
+                "gds_layer": gds_layer,
+                "gds_datatype": gds_datatype,
+                "display_name": f"{layer_name}.{purpose}"
+            })
+
+    return layers
+
+
+def generate_lyp(layers: list[dict]) -> str:
+    """Generate a basic KLayout .lyp XML from layer mapping."""
+    root = Element("layer-properties")
+
+    for layer in layers:
+        props = SubElement(root, "properties")
+        SubElement(props, "frame-color").text = "#ff9d9d"
+        SubElement(props, "fill-color").text = "#ff9d9d"
+        SubElement(props, "frame-brightness").text = "0"
+        SubElement(props, "fill-brightness").text = "0"
+        SubElement(props, "dither-pattern").text = "I9"
+        SubElement(props, "visible").text = "true"
+        SubElement(props, "transparent").text = "false"
+        SubElement(props, "width").text = "1"
+        SubElement(props, "marked").text = "false"
+        SubElement(props, "animation").text = "0"
+        SubElement(props, "name").text = layer["display_name"]
+        source = f"{layer['gds_layer']}/{layer['gds_datatype']}"
+        SubElement(props, "source").text = source
+
+    return _pretty_xml(root)
 
 
 @mcp.tool
@@ -173,6 +248,55 @@ def run_drc(layout_file: str, drc_script: str, top_cell: str = None) -> dict:
             "report_generated": report_exists,
             "command": " ".join(cmd)
         }
+    except Exception as e:
+        return {"error": str(e), "status": "error"}
+
+
+@mcp.tool
+def translate_laker_tf(tf_file: str, output_lyp: str = None) -> dict:
+    """
+    Convert a Laker Technology File (.tf) into KLayout layer properties (.lyp).
+
+    Extracts layer names, purposes, and GDS layer/datatype numbers,
+    then generates a .lyp file that KLayout can load to show human-readable layer names.
+
+    Args:
+        tf_file: Path to the Laker .tf file
+        output_lyp: Optional path to write the .lyp file. If omitted, only returns the mapping.
+
+    Returns:
+        Mapping list and (if written) the output file path.
+    """
+    try:
+        path = _safe_path(tf_file)
+        content = path.read_text(encoding="utf-8", errors="ignore")
+
+        layers = parse_laker_tf(content)
+
+        if not layers:
+            return {
+                "status": "warning",
+                "message": "No layers found. Check if the TF contains tfLayoutLayerTable or tfStreamIoTable sections.",
+                "layers": []
+            }
+
+        result = {
+            "status": "ok",
+            "input_file": str(path),
+            "num_layers": len(layers),
+            "layers": layers
+        }
+
+        if output_lyp:
+            lyp_path = Path(output_lyp).expanduser().resolve()
+            lyp_path.parent.mkdir(parents=True, exist_ok=True)
+            lyp_content = generate_lyp(layers)
+            lyp_path.write_text(lyp_content, encoding="utf-8")
+            result["output_lyp"] = str(lyp_path)
+            result["message"] = f"Wrote {len(layers)} layers to {lyp_path}"
+
+        return result
+
     except Exception as e:
         return {"error": str(e), "status": "error"}
 
