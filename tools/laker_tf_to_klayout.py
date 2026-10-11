@@ -10,7 +10,7 @@ This script:
 2. Generates:
    - <tech>.lyp          (layer properties)
    - connectivity.txt    (human-readable connection rules)
-   - <tech>.lyt          (KLayout technology definition)
+   - <tech>.lyt          (KLayout technology definition with connectivity)
 3. Optionally prints a klayout command line to open a GDS with the generated technology.
 
 Designed to be called from a wrapper script before launching KLayout.
@@ -34,7 +34,7 @@ def extract_block(content: str, block_name: str) -> str:
     return match.group(1) if match else ""
 
 
-def parse_layers(content: str) -> list[dict]:
+def parse_layers(content: str) -> tuple[list[dict], dict]:
     """Parse layer definitions from stream table (preferred) or layout layer table."""
     layers = []
     lookup = {}
@@ -146,7 +146,7 @@ def generate_lyp(layers: list[dict]) -> str:
 def generate_connectivity_txt(connections: list[dict]) -> str:
     lines = [
         "# Connectivity rules generated from Laker tfLayoutConnection",
-        "# Use as reference in KLayout Technology Manager → Connectivity",
+        "# These are also embedded in the .lyt file",
     ]
     for c in connections:
         lines.append(
@@ -155,7 +155,30 @@ def generate_connectivity_txt(connections: list[dict]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def generate_lyt(tech_name: str, lyp_filename: str) -> str:
+def generate_lyt(tech_name: str, lyp_filename: str, connections: list[dict]) -> str:
+    """Generate .lyt with embedded connectivity (symbols + connections)."""
+    # Collect unique symbols (layer name -> GDS expression)
+    symbols = {}
+    for c in connections:
+        symbols[c["from_layer"]] = c["from"]
+        symbols[c["to_layer"]] = c["to"]
+        symbols[c["via_layer"]] = c["via"]
+
+    conn_xml = []
+    for c in connections:
+        # Format: from_layer,via_layer,to_layer
+        conn_xml.append(
+            f"    <connection>{c['from_layer']},{c['via_layer']},{c['to_layer']}</connection>"
+        )
+
+    symbol_xml = []
+    for name, expr in sorted(symbols.items()):
+        symbol_xml.append(f"    <symbols>{name}='{expr}'</symbols>")
+
+    connectivity_block = ""
+    if conn_xml or symbol_xml:
+        connectivity_block = "\n  <connectivity>\n" + "\n".join(conn_xml + symbol_xml) + "\n  </connectivity>"
+
     return f'''<?xml version="1.0" encoding="utf-8"?>
 <technology>
   <name>{tech_name}</name>
@@ -170,7 +193,7 @@ def generate_lyt(tech_name: str, lyp_filename: str) -> str:
     <gds2>
       <create-other-layers>true</create-other-layers>
     </gds2>
-  </reader-options>
+  </reader-options>{connectivity_block}
 </technology>
 '''
 
@@ -202,14 +225,14 @@ def main():
 
     lyp_file.write_text(generate_lyp(layers), encoding="utf-8")
     conn_file.write_text(generate_connectivity_txt(connections), encoding="utf-8")
-    lyt_file.write_text(generate_lyt(tech_name, lyp_file.name), encoding="utf-8")
+    lyt_file.write_text(generate_lyt(tech_name, lyp_file.name, connections), encoding="utf-8")
 
     print(f"Generated technology files in: {out_dir}")
     print(f"  Layers:        {len(layers)}")
     print(f"  Connections:   {len(connections)}")
     print(f"  .lyp:          {lyp_file}")
     print(f"  connectivity:  {conn_file}")
-    print(f"  .lyt:          {lyt_file}")
+    print(f"  .lyt:          {lyt_file} (includes connectivity)")
 
     if args.gds:
         gds_path = Path(args.gds).expanduser().resolve()
