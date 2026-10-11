@@ -5,6 +5,7 @@ Tools:
 - get_layout_info: Read GDS/OAS and return basic cell / layer / bbox info
 - run_drc: Run a KLayout .drc script in batch mode and return output summary
 - translate_laker_tf: Convert Laker Technology File (.tf) to KLayout layer properties (.lyp)
+  and connectivity rules for consistent net tracing
 
 Requirements:
   pip install fastmcp klayout
@@ -60,30 +61,29 @@ def _pretty_xml(elem: Element) -> str:
     return reparsed.toprettyxml(indent="  ")
 
 
-def parse_laker_tf(tf_content: str) -> list[dict]:
+def parse_laker_tf(tf_content: str) -> tuple[list[dict], list[dict]]:
     """
-    Parse Laker Technology File for layer name + purpose + GDS layer/datatype.
+    Parse Laker Technology File for layers and connectivity.
 
-    Supports common sections:
-    - tfLayoutLayerTable
-    - tfStreamIoTable
+    Returns:
+        layers: list of layer mappings
+        connections: list of connection rules (for net tracing)
     """
     layers = []
+    connections = []
 
-    # Match lines like: def { LayerName purpose gds_number ... } or def { LayerName purpose gds_number datatype }
-    # Flexible pattern for both tables
-    pattern = re.compile(
+    # Layer mapping pattern
+    layer_pattern = re.compile(
         r"def\s*\{\s*(\w+)\s+(\w+)\s+(\d+)(?:\s+(\d+))?",
         re.IGNORECASE
     )
 
-    for match in pattern.finditer(tf_content):
+    for match in layer_pattern.finditer(tf_content):
         layer_name = match.group(1)
         purpose = match.group(2)
         gds_layer = int(match.group(3))
         gds_datatype = int(match.group(4)) if match.group(4) else 0
 
-        # Avoid duplicates (prefer stream table entries if present)
         key = (layer_name, purpose)
         existing = next((l for l in layers if (l["layer_name"], l["purpose"]) == key), None)
         if existing:
@@ -98,7 +98,32 @@ def parse_laker_tf(tf_content: str) -> list[dict]:
                 "display_name": f"{layer_name}.{purpose}"
             })
 
-    return layers
+    # Simple connectivity heuristics (common metal/via stacking)
+    # Look for sequential metal layers or via-related names
+    metal_layers = [l for l in layers if re.search(r"metal|met|m\d+", l["layer_name"], re.I)]
+    via_layers = [l for l in layers if re.search(r"via|cont|contact", l["layer_name"], re.I)]
+
+    # Example: connect consecutive metals through vias if names suggest it
+    for i, metal in enumerate(metal_layers):
+        if i + 1 < len(metal_layers):
+            next_metal = metal_layers[i + 1]
+            # Try to find a matching via
+            via = next((v for v in via_layers if str(i + 1) in v["layer_name"] or "via" in v["layer_name"].lower()), None)
+            if via:
+                connections.append({
+                    "from": f"{metal['gds_layer']}/{metal['gds_datatype']}",
+                    "via": f"{via['gds_layer']}/{via['gds_datatype']}",
+                    "to": f"{next_metal['gds_layer']}/{next_metal['gds_datatype']}",
+                    "description": f"{metal['layer_name']} --{via['layer_name']}--> {next_metal['layer_name']}"
+                })
+            else:
+                connections.append({
+                    "from": f"{metal['gds_layer']}/{metal['gds_datatype']}",
+                    "to": f"{next_metal['gds_layer']}/{next_metal['gds_datatype']}",
+                    "description": f"{metal['layer_name']} --> {next_metal['layer_name']} (direct)"
+                })
+
+    return layers, connections
 
 
 def generate_lyp(layers: list[dict]) -> str:
@@ -122,6 +147,18 @@ def generate_lyp(layers: list[dict]) -> str:
         SubElement(props, "source").text = source
 
     return _pretty_xml(root)
+
+
+def generate_connectivity_txt(connections: list[dict]) -> str:
+    """Generate a simple text description of connectivity for KLayout layer stack."""
+    lines = ["# KLayout Connectivity Rules (generated from Laker TF)",
+             "# Use these in Tools > Edit Layer Stack or NetTracerConnectivity"]
+    for conn in connections:
+        if "via" in conn:
+            lines.append(f"connection: {conn['from']} --via({conn['via']})--> {conn['to']}  # {conn['description']}")
+        else:
+            lines.append(f"connection: {conn['from']} --> {conn['to']}  # {conn['description']}")
+    return "\n".join(lines) + "\n"
 
 
 @mcp.tool
@@ -253,38 +290,44 @@ def run_drc(layout_file: str, drc_script: str, top_cell: str = None) -> dict:
 
 
 @mcp.tool
-def translate_laker_tf(tf_file: str, output_lyp: str = None) -> dict:
+def translate_laker_tf(tf_file: str, output_lyp: str = None, output_connectivity: str = None) -> dict:
     """
-    Convert a Laker Technology File (.tf) into KLayout layer properties (.lyp).
+    Convert a Laker Technology File (.tf) into KLayout layer properties (.lyp)
+    and connectivity rules for consistent net tracing.
 
-    Extracts layer names, purposes, and GDS layer/datatype numbers,
-    then generates a .lyp file that KLayout can load to show human-readable layer names.
+    Extracts:
+    - Layer names, purposes, GDS layer/datatype
+    - Basic metal/via connectivity stacking (for Trace Net)
 
     Args:
         tf_file: Path to the Laker .tf file
-        output_lyp: Optional path to write the .lyp file. If omitted, only returns the mapping.
+        output_lyp: Optional path to write the .lyp file
+        output_connectivity: Optional path to write a connectivity description (.txt)
 
     Returns:
-        Mapping list and (if written) the output file path.
+        Mapping, connections, and output file paths.
     """
     try:
         path = _safe_path(tf_file)
         content = path.read_text(encoding="utf-8", errors="ignore")
 
-        layers = parse_laker_tf(content)
+        layers, connections = parse_laker_tf(content)
 
         if not layers:
             return {
                 "status": "warning",
                 "message": "No layers found. Check if the TF contains tfLayoutLayerTable or tfStreamIoTable sections.",
-                "layers": []
+                "layers": [],
+                "connections": []
             }
 
         result = {
             "status": "ok",
             "input_file": str(path),
             "num_layers": len(layers),
-            "layers": layers
+            "num_connections": len(connections),
+            "layers": layers,
+            "connections": connections
         }
 
         if output_lyp:
@@ -293,7 +336,16 @@ def translate_laker_tf(tf_file: str, output_lyp: str = None) -> dict:
             lyp_content = generate_lyp(layers)
             lyp_path.write_text(lyp_content, encoding="utf-8")
             result["output_lyp"] = str(lyp_path)
-            result["message"] = f"Wrote {len(layers)} layers to {lyp_path}"
+
+        if output_connectivity:
+            conn_path = Path(output_connectivity).expanduser().resolve()
+            conn_path.parent.mkdir(parents=True, exist_ok=True)
+            conn_content = generate_connectivity_txt(connections)
+            conn_path.write_text(conn_content, encoding="utf-8")
+            result["output_connectivity"] = str(conn_path)
+
+        if output_lyp or output_connectivity:
+            result["message"] = "Generated layer properties and/or connectivity rules."
 
         return result
 
