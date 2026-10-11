@@ -1,0 +1,5 @@
+# Example connectivity rules (replace with output from translate_laker_tf)
+# Use these as reference when setting up Tools → Manage Technologies → Connectivity
+
+connection: 10/0 --via(20/0)--> 11/0  # AA --CT--> M1
+connection: 11/0 --via(21/0)--> 12/0  # M1 --V1--> M2
